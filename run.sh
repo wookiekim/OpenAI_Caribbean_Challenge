@@ -1,16 +1,25 @@
-python train_validation.py \
+# Training
+python train.py \
   --batch_size 32 \
   --learning_rate 0.0001 \
   --momentum 0.5 \
   --weight_decay 0.01 \
-  --epoch 200 \
-  --model_name resnet_valtest.pt \
+  --epoch 150 \
+  --model_name temp.pt \
   --pretrained_name resnet18 \
   --train_all False \
   --upsampling True \
   --retrain True \
-  --patience 15
+  --patience 20 \
+  --note with_class_weights_maxOverMin
+
+# Testing
+#    if retrain==True, and you want to test on the retrained model
+#    append "retrained_" in front of model_name
+python test.py \
+  --model_name temp.pt \
+  --pretrained_name resnet18
 
 python test.py \
-  --model_name resnet_valtest.pt \
+  --model_name retrained_temp.pt \
   --pretrained_name resnet18
