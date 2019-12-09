@@ -22,10 +22,49 @@ import matplotlib.pyplot as plt
 import numpy as np
 import SYNet
 
+import sklearn.metrics
+import itertools
+
+from tensorboardX import SummaryWriter
+writer = SummaryWriter('runs/nonupsampled_resnet18')
+
 log = ""
+class_names = ["concrete_cement","healthy_metal","incomplete","irregular","other"]
+
+def plot_confusion_matrix(cm, class_names):
+  figure = plt.figure(figsize=(8, 8))
+  plt.imshow(cm, interpolation='nearest', cmap=plt.cm.YlGn)
+  plt.title("Confusion matrix")
+  plt.colorbar()
+  tick_marks = np.arange(len(class_names))
+  plt.xticks(tick_marks, class_names, rotation=45)
+  plt.yticks(tick_marks, class_names)
+
+  # Normalize the confusion matrix.
+  cm = np.around(cm.astype('float') / cm.sum(axis=1)[:, np.newaxis], decimals=2)
+
+  # Use white text if squares are dark; otherwise black.
+  threshold = cm.max() / 2.
+  for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+    color = "gray" if cm[i, j] > threshold else "black"
+    plt.text(j, i, cm[i, j], horizontalalignment="center", color=color)
+
+  plt.tight_layout()
+  plt.ylabel('True label')
+  plt.xlabel('Predicted label')
+  return figure
+
+def log_confusion_matrix(epoch, output, label):
+  # Calculate the confusion matrix.
+  cm = sklearn.metrics.confusion_matrix(label, output)
+  # Log the confusion matrix as an image summary.
+  figure = plot_confusion_matrix(cm, class_names=class_names)
+
+  # Log the confusion matrix as an image summary.
+  writer.add_figure('Valid/confusion_matrix', figure, epoch)
 
 class EarlyStopping:
-    def __init__(self, patience=5, verbose=False, delta=0):
+    def __init__(self, patience=5, verbose=False, delta=0, backbone=None):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
@@ -34,6 +73,7 @@ class EarlyStopping:
         self.val_loss_min = np.Inf
         self.delta = delta
         self.best_step = -1
+        self.backbone = backbone
 
     def __call__(self, val_loss, model, epoch):
 
@@ -56,7 +96,7 @@ class EarlyStopping:
     def save_checkpoint(self, val_loss, model, epoch):
         if self.verbose:
             print(f'Validation loss decreased at epoch {epoch} ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-        torch.save(model.state_dict(), 'checkpoint.pt')
+        torch.save(model.state_dict(), '{}_checkpoint.pt'.format(self.backbone))
         self.val_loss_min = val_loss
         self.best_step = epoch 
 
@@ -79,7 +119,7 @@ class RoofDataset(Dataset):
         return len(self.image_paths)
 
 
-def load_data(batch_size, upsampling, retrain):
+def load_data(batch_size, upsampling, retrain, options):
 
     # Define Class Labels
     concrete_cement_type = [1.0, 0.0, 0.0, 0.0, 0.0]
@@ -113,23 +153,25 @@ def load_data(batch_size, upsampling, retrain):
     train_images = [item for sublist in train_images for item in sublist]
     train_images_labels = [item for sublist in train_images_labels for item in sublist]
     
+    scale = 299 if options.pretrained_name=='inception' else 224 
+
     transformations = transforms.Compose([
         transforms.RandomHorizontalFlip(), 
         transforms.RandomRotation(degrees = 90, resample = False, expand = True),
         transforms.RandomVerticalFlip(),
-        transforms.ColorJitter(brightness = 0.2, contrast = 0.1),
-        transforms.Resize((224,224)),
-        transforms.ToTensor()
+        transforms.Resize((scale,scale)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     print('Length of given dataset : {}'.format(len(train_images))) 
     validation_images = train_images[::5]
     validation_images_labels = train_images_labels[::5]
 
     if not retrain:
-        indices = [i for i in range(len(train_images)) if (i-1) % 5]
+        indices = [i for i in range(len(train_images)) if (i) % 5]
         train_images = [train_images[i] for i in indices]
         train_images_labels = [train_images_labels[i] for i in indices]
-
+    
     train_dataset = RoofDataset(train_images, 
                                 train_images_labels,
                                 transformations)
@@ -140,8 +182,9 @@ def load_data(batch_size, upsampling, retrain):
                          )
 
     valid_transforms = transforms.Compose([
-        transforms.Resize((224,224)),
-        transforms.ToTensor()
+        transforms.Resize((scale,scale)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) 
     ])
     valid_dataset = RoofDataset(validation_images,
                                 validation_images_labels,
@@ -163,17 +206,23 @@ def train(epochs, train_loader, valid_loader, options, best_step=None):
                           momentum=float(options.momentum),
                           weight_decay=float(options.weight_decay))
     
-    class_weights = [7381/1387, 7381/7381, 7381/668, 7381/5241, 7381/193]
-    if eval(options.upsampling):
-        class_weights = [7381/1387, 7381/7381, 7381/(668 * 2), 7381/5241, 7381/(193 * 5)]
-    class_weights = torch.FloatTensor(class_weights)
-    criterion = nn.CrossEntropyLoss(weight=class_weights.cuda())
- 
+    #class_weights = [7381/1387, 7381/7381, 7381/668, 7381/5241, 7381/193]
+    #if eval(options.upsampling):
+    #    class_weights = [7381/1387, 7381/7381, 7381/(668 * 2), 7381/5241, 7381/(193 * 5)]
+    #class_weights = torch.FloatTensor(class_weights)
+    #criterion = nn.CrossEntropyLoss(weight=class_weights.cuda())
+    criterion = nn.CrossEntropyLoss()
+
+    train_tag = 'Train'
+    valid_tag = 'Valid'
+
     if best_step is None:
-        early_stopping = EarlyStopping(patience=options.patience, verbose=True)
+        early_stopping = EarlyStopping(patience=options.patience, verbose=True, backbone=options.pretrained_name)
 
     if best_step is not None:
         epochs = best_step
+        train_tag = "Retrain"
+        valid_tag = "Revalid"
 
     for epoch in range(1, epochs + 1):
         train_losses = []
@@ -183,29 +232,62 @@ def train(epochs, train_loader, valid_loader, options, best_step=None):
             target = target.cuda(async=True)
             optimizer.zero_grad()
             output = model(data)
+            # Output format different for inception
+            output = output[0] if options.pretrained_name == 'inception' else output
             _, idx = torch.max(target,1)
             loss = criterion(output, idx)
             train_losses.append(loss.item())
             loss.backward()
-            optimizer.step()
+            optimizer`.step()
             if batch_idx % 30 == 0:
                 print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                     epoch, batch_idx * len(data), len(train_loader.dataset),
                     100. * batch_idx / len(train_loader), loss.data))
-        
+                writer.add_scalar('{}/batch_loss'.format(train_tag), 
+                                  loss.item(), 
+                                  (epoch - 1) * len(train_loader) + batch_idx)
         valid_losses = []
+        nll_losses = []
+        predlist = torch.zeros(0,dtype=torch.long, device='cpu')
+        labellist = torch.zeros(0,dtype=torch.long, device='cpu')
         with torch.no_grad():
-            for data, target in valid_loader:
+            for batch_idx, (data, target) in enumerate(valid_loader):
                 model.eval()
                 data, target = data.cuda(), target.cuda()
+                # Output format different for inception
                 output = model(data)
+                output = output[0] if options.pretrained_name == 'inception' else output
                 _, idx = torch.max(target, 1)
+                _, pred = torch.max(output, 1)
+
+                predlist=torch.cat([predlist,pred.view(-1).cpu()])
+                labellist = torch.cat([labellist,idx.view(-1).cpu()])
+
                 loss = criterion(output, idx)
+                subloss = nn.functional.nll_loss(nn.functional.log_softmax(output, dim=1), idx)
                 valid_losses.append(loss.item())
+                nll_losses.append(subloss.item())
+                if batch_idx % 30 == 0:
+                    writer.add_scalar('{}/batch_loss'.format(valid_tag),
+                                      loss.item(),
+                                      (epoch - 1) * len(valid_loader) + batch_idx)
+        if best_step is None and epoch % 10 == 0:
+            log_confusion_matrix(epoch, predlist.numpy(), labellist.numpy())
         print('\nEpoch: [{} / {}], Train Loss: {} | Validation Loss: {}\n'.format(epoch, 
                                                              epochs,
                                                              np.average(train_losses),
-                                                             np.average(valid_losses))) 
+                                                             np.average(valid_losses)))
+        print("nllLoss: {}\n".format(np.average(nll_losses)))
+        writer.add_scalar('{}/epoch_loss'.format(train_tag),
+                          np.average(train_losses),
+                          epoch)
+        writer.add_scalar('{}/epoch_loss'.format(valid_tag),
+                          np.average(valid_losses),
+                          epoch)
+        writer.add_scalar('{}/epoch_nll_loss'.format(valid_tag),
+                          np.average(nll_losses),
+                          epoch)
+
         if best_step is None:
             early_stopping(np.average(valid_losses), model, epoch)
         
@@ -217,7 +299,7 @@ def train(epochs, train_loader, valid_loader, options, best_step=None):
         best_step = early_stopping.best_step
         log += "Best step achieved: {}\n".format(best_step)
         log += "Best valloss achieved: {}\n".format(early_stopping.val_loss_min)
-        model.load_state_dict(torch.load('checkpoint.pt'))
+        model.load_state_dict(torch.load('{}_checkpoint.pt'.format(options.pretrained_name)))
         print("Best model loaded from checkpoint successfully")
     log += "Final Validation Error achieved: {}\n".format(np.average(valid_losses))
     return model, best_step
@@ -252,7 +334,9 @@ def main():
     required=True, help="brief description of model being trained")    
 
     options = parser.parse_args()
-   
+    
+    print(options.pretrained_name)
+ 
     global log
  
     log += "=====================================\n"
@@ -267,7 +351,7 @@ def main():
     log += "Momentum : {} | Weight decay : {}\n".format(options.momentum, options.weight_decay)
     log += "Epoch: {} | Patience : {}\n".format(options.epoch, options.patience)
     train_loader, valid_loader  = \
-        load_data(int(options.batch_size), eval(options.upsampling), retrain=False)
+        load_data(int(options.batch_size), eval(options.upsampling), False, options)
     log += "\n Training summary: \n"
     model, best_step = train(int(options.epoch), train_loader, valid_loader, options)
     
@@ -282,14 +366,14 @@ def main():
         log += "\n Retraining summary: \n"
         print("\nRetraining INCLUDING valset, up to {} epochs".format(best_step))
         train_loader, valid_loader = \
-            load_data(int(options.batch_size), eval(options.upsampling), retrain=True)
+            load_data(int(options.batch_size), eval(options.upsampling), True, options)
         model, _ = train(int(options.epoch), train_loader, valid_loader, options, best_step)
  
         torch.save(model.state_dict(), 
                    './models/retrained_{}'.format(options.model_name))
         print("Retrained model has been saved. {}".format('./models/retrained_{}'.format(options.model_name)))
     
-    log += "======================================\n"
+    log += "=====================================\n"
 
     with open ("log.txt", "a") as f:
         f.write(log)
